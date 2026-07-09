@@ -63,6 +63,11 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 Access the Web UI directly at https://11.54.401.33:8998
 ```
 
+**Gatekeeper:** To restrict a session to English-only, on-topic conversation (e.g. the PersonaFlex U.S.-trucking persona), add `--gatekeeper`. This runs local VAD + ASR against the user's speech and an external Claude Haiku classifier in the background, and best-effort interrupts+replaces the model's output with a fixed rejection clip when a turn is flagged non-English or off-topic — enforcement is best-effort, not a hard block, since it can't undo audio already streamed to the client. Requires `ANTHROPIC_API_KEY` (see `.env.example`) and rendered rejection clips (`python -m moshi.scripts.render_gatekeeper_clips`, requires `pip install pyttsx3`):
+```bash
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --gatekeeper
+```
+
 ### Offline Evaluation
 
 For offline evaluation use the offline script that streams in an input wav file and produces an output wav file from the captured output stream. The output file will be the same duration as the input file.

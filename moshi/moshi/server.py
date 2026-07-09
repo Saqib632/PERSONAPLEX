@@ -46,6 +46,7 @@ import torch
 import random
 
 from .client_utils import make_log, colorize
+from .gatekeeper import GatekeeperResources, GatekeeperSession
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
@@ -96,12 +97,14 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 gatekeeper_resources: Optional[GatekeeperResources] = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.gatekeeper_resources = gatekeeper_resources
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -217,9 +220,11 @@ class ServerState:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     be = time.time()
-                    chunk = all_pcm_data[: self.frame_size]
+                    raw_chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
-                    chunk = torch.from_numpy(chunk)
+                    if gatekeeper_session is not None:
+                        gatekeeper_session.on_input_chunk(raw_chunk)
+                    chunk = torch.from_numpy(raw_chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
@@ -231,9 +236,17 @@ class ServerState:
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        main_pcm_np = main_pcm[0, 0].numpy()
+                        was_muting = gatekeeper_session is not None and gatekeeper_session.is_muting()
+                        rejection_text = gatekeeper_session.pending_rejection_text() if gatekeeper_session is not None else None
+                        if gatekeeper_session is not None:
+                            main_pcm_np = gatekeeper_session.filter_output(main_pcm_np, self.frame_size)
+                        opus_writer.append_pcm(main_pcm_np)
                         text_token = tokens[0, 0, 0].item()
-                        if text_token not in (0, 3):
+                        if rejection_text is not None:
+                            msg = b"\x02" + bytes(rejection_text, encoding="utf8")
+                            await ws.send_bytes(msg)
+                        elif text_token not in (0, 3) and not was_muting:
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
@@ -260,6 +273,11 @@ class ServerState:
             if seed is not None and seed != -1:
                 seed_all(seed)
 
+            gatekeeper_session: Optional[GatekeeperSession] = (
+                self.gatekeeper_resources.new_session(self.mimi.sample_rate, clog.log)
+                if self.gatekeeper_resources is not None
+                else None
+            )
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
@@ -390,6 +408,26 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--gatekeeper", action="store_true",
+        help="Enable the best-effort PersonaFlex language/topic gatekeeper. "
+             "Requires ANTHROPIC_API_KEY to be set."
+    )
+    parser.add_argument(
+        "--gatekeeper-asr-device", type=str, default="cpu",
+        help="Device for the gatekeeper's local ASR model, defaults to 'cpu' "
+             "to avoid competing with the main model for GPU memory."
+    )
+    parser.add_argument(
+        "--gatekeeper-reject-lang-clip", type=str,
+        default=str(Path(__file__).resolve().parents[2] / "assets" / "gatekeeper" / "reject_language.wav"),
+        help="Path to the pre-rendered language-rejection audio clip."
+    )
+    parser.add_argument(
+        "--gatekeeper-reject-topic-clip", type=str,
+        default=str(Path(__file__).resolve().parents[2] / "assets" / "gatekeeper" / "reject_topic.wav"),
+        help="Path to the pre-rendered topic-rejection audio clip."
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -445,6 +483,18 @@ def main():
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
+
+    gatekeeper_resources = None
+    if args.gatekeeper:
+        logger.info("loading gatekeeper resources (VAD, ASR, classifier, rejection clips)")
+        gatekeeper_resources = GatekeeperResources.load(
+            asr_device=args.gatekeeper_asr_device,
+            lang_clip_path=Path(args.gatekeeper_reject_lang_clip),
+            topic_clip_path=Path(args.gatekeeper_reject_topic_clip),
+            target_sample_rate=loaders.SAMPLE_RATE,
+        )
+        logger.info("gatekeeper resources loaded")
+
     state = ServerState(
         mimi=mimi,
         other_mimi=other_mimi,
@@ -453,6 +503,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        gatekeeper_resources=gatekeeper_resources,
     )
     logger.info("warming up the model")
     state.warmup()
